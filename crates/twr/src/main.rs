@@ -2000,6 +2000,7 @@ fn build_ctx<'a>(
                 inner: twr_tx::ClientTransactionV1::new(kb, c.animation_key),
             })
         });
+    let tx_from_cache = tx.is_some();
     let locale = twr_client::headers::locale_tag(|k| std::env::var(k).ok());
     cli::exec::ExecCtx {
         transport,
@@ -2022,6 +2023,7 @@ fn build_ctx<'a>(
         locale,
         tx,
         tx_cache_path: twr_tx::cache::default_cache_path(),
+        tx_from_cache,
         tx_attempted: false,
         tx_failure: None,
         verbose: opts.verbose > 0,
@@ -4260,7 +4262,7 @@ async fn run_engage(
             Err(_) => Err((format!("{cmd} failed: transport error"), 5)),
         }
     } else {
-        match cli::exec::post_engage_graphql(&mut ctx, desc.op, &target_id).await {
+        match cli::exec::post_engage_graphql(&mut ctx, desc.op, &target_id, cmd).await {
             Ok(post) => {
                 let r = &post.response;
                 if r.status == 429 {

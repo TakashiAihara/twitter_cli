@@ -25,7 +25,10 @@ pub struct ExecCtx<'a> {
     pub tx: Option<TxState>,
     /// Where freshly derived ingredients are persisted; `None` skips caching.
     pub tx_cache_path: Option<std::path::PathBuf>,
-    /// Set once a derivation was tried, so a failing X is hit once per run.
+    /// True while `tx` came from the disk cache rather than from a derivation
+    /// in this run; only then can a rejection mean the cached material is bad.
+    pub tx_from_cache: bool,
+    /// Set once this run tried to derive, so a failing X is hit at most once.
     pub tx_attempted: bool,
     /// Why the last derivation failed; reported when a gated op then fails.
     pub tx_failure: Option<String>,
@@ -61,45 +64,58 @@ impl<'a> ExecCtx<'a> {
         self.tx_attempted = true;
         match self.derive_tx_ingredients().await {
             Ok(ingredients) => {
-                self.tx_failure = None;
-                if let Some(path) = &self.tx_cache_path {
-                    if let Err(e) = twr_tx::cache::store(path, &ingredients) {
-                        self.note(&format!(
-                            "twr: could not cache the transaction ingredients at {} ({e})",
-                            path.display()
-                        ));
-                    }
-                }
-                if let Ok(key_bytes) = ingredients.key_bytes() {
-                    self.tx = Some(TxState {
-                        inner: twr_tx::ClientTransactionV1::new(
-                            key_bytes,
-                            ingredients.animation_key,
-                        ),
-                    });
-                }
+                self.install_ingredients(operation, ingredients);
             }
-            Err(why) => {
-                self.note(&format!(
-                    "twr: no x-client-transaction-id for {operation} ({why})"
-                ));
-                self.tx_failure = Some(why);
-            }
+            Err(why) => self.fail_tx(operation, why),
         }
     }
 
-    /// Drop the cached ingredients and derive them again. A gated op that was
+    /// Use freshly derived ingredients and cache them. Unusable ones are
+    /// rejected before they reach the cache, where they would be served for
+    /// the next hour.
+    fn install_ingredients(
+        &mut self,
+        operation: &str,
+        ingredients: twr_tx::cache::CachedIngredients,
+    ) {
+        let key_bytes = match ingredients.key_bytes() {
+            Ok(key_bytes) => key_bytes,
+            Err(why) => return self.fail_tx(operation, why),
+        };
+        if let Some(path) = &self.tx_cache_path {
+            if let Err(e) = twr_tx::cache::store(path, &ingredients) {
+                self.note(&format!(
+                    "twr: could not cache the transaction ingredients at {} ({e})",
+                    path.display()
+                ));
+            }
+        }
+        self.tx_failure = None;
+        self.tx_from_cache = false;
+        self.tx = Some(TxState {
+            inner: twr_tx::ClientTransactionV1::new(key_bytes, ingredients.animation_key),
+        });
+    }
+
+    fn fail_tx(&mut self, operation: &str, why: String) {
+        self.note(&format!(
+            "twr: no x-client-transaction-id for {operation} ({why})"
+        ));
+        self.tx_failure = Some(why);
+    }
+
+    /// Drop cached ingredients and derive them again. A gated op that was
     /// rejected despite its header may have been signed with stale or wrong
-    /// material, which the 1h cache would otherwise keep serving.
+    /// material, which the 1h cache would otherwise keep serving. Ingredients
+    /// derived in this run are not re-fetched: the next id is just a new one.
     pub async fn refresh_tx(&mut self, operation: &str) {
-        if !twr_tx::GATED_OPS.contains(&operation) {
+        if !twr_tx::GATED_OPS.contains(&operation) || !self.tx_from_cache {
             return;
         }
         if let Some(path) = &self.tx_cache_path {
             let _ = std::fs::remove_file(path);
         }
         self.tx = None;
-        self.tx_attempted = false;
         self.ensure_tx(operation).await;
     }
 
@@ -427,31 +443,44 @@ pub async fn fetch_tweets_paged(
 pub struct EngagePost {
     pub response: twr_client::TransportResponse,
     pub resent: bool,
+    /// Whether the first request carried an id; a failed refresh can leave
+    /// `ctx.tx` empty although that request was signed.
+    pub first_had_tx: bool,
 }
 
 /// POST one GraphQL engagement mutation (like / bookmark / retweet / pin …).
 /// Gated ops (`CreateBookmark`, `DeleteBookmark`) carry a freshly minted
 /// `x-client-transaction-id`; X answers them 404 without it. X also 404s a
 /// small share of requests that do carry one, and a cached key that went
-/// stale does the same, so a gated 404 is resent once with re-derived
-/// ingredients and a new id.
+/// stale does the same, so a gated 404 is resent once with a new id (and
+/// re-derived ingredients when the old ones came from the disk cache).
+///
+/// The resend is a second write attempt that the caller's budget count does
+/// not see; it goes through the throttle under `throttle_key` like the first.
 pub async fn post_engage_graphql(
     ctx: &mut ExecCtx<'_>,
     op: &str,
     target_id: &str,
+    throttle_key: &str,
 ) -> Result<EngagePost, twr_client::TransportError> {
     ctx.ensure_tx(op).await;
+    let first_had_tx = ctx.tx.is_some();
     let mut response = send_engage(ctx, op, target_id).await?;
     let mut resent = false;
     if response.status == 404 && twr_tx::GATED_OPS.contains(&op) {
         ctx.refresh_tx(op).await;
-        // Without a new id the resend would be the same rejected request.
+        // Without an id the resend would be the same rejected request.
         if ctx.tx.is_some() {
+            throttle_wait(&mut ctx.throttle, throttle_key).await;
             response = send_engage(ctx, op, target_id).await?;
             resent = true;
         }
     }
-    Ok(EngagePost { response, resent })
+    Ok(EngagePost {
+        response,
+        resent,
+        first_had_tx,
+    })
 }
 
 async fn send_engage(
@@ -490,9 +519,9 @@ async fn send_engage(
         .await
 }
 
-/// Error data for a non-2xx engagement response. A 404 on a gated op is not
-/// evidence of a stale query id, so it names the transaction-id side instead
-/// of letting the exit-6 default point at `doctor --refresh`.
+/// Error data for a non-2xx engagement response. A 404 on a gated op has two
+/// possible causes (a missing or wrong transaction id, or a stale query id),
+/// so the message says what was actually sent and the suggestion names both.
 pub fn engage_failure_data(
     ctx: &ExecCtx<'_>,
     cmd: &str,
@@ -503,21 +532,17 @@ pub fn engage_failure_data(
     if status != 404 || !twr_tx::GATED_OPS.contains(&op) {
         return serde_json::json!({"error": format!("{cmd} failed: HTTP {status}")});
     }
-    if ctx.tx.is_some() {
-        let resent = if post.resent {
-            " (resent once with re-derived ingredients)"
-        } else {
-            ""
-        };
-        return serde_json::json!({
-            "error": format!("{cmd} failed: HTTP 404 even with an x-client-transaction-id{resent}"),
-            "suggestion": "retry once; if it keeps failing, the x-client-transaction-id derivation has probably drifted and needs re-porting",
-        });
-    }
     let why = ctx.tx_failure.as_deref().unwrap_or("not derived");
+    let error = if post.resent {
+        format!("{cmd} failed: HTTP 404 even with an x-client-transaction-id (resent once with a new id)")
+    } else if post.first_had_tx {
+        format!("{cmd} failed: HTTP 404 with an x-client-transaction-id; deriving new ingredients failed, so it was not resent ({why})")
+    } else {
+        format!("{cmd} failed: HTTP 404, no x-client-transaction-id was sent ({why})")
+    };
     serde_json::json!({
-        "error": format!("{cmd} failed: HTTP 404, no x-client-transaction-id was sent ({why})"),
-        "suggestion": "check that x.com and abs.twimg.com are reachable, then retry",
+        "error": error,
+        "suggestion": "retry once; if it keeps failing, either the query id is stale (run `twr doctor --refresh`) or the x-client-transaction-id derivation has drifted and needs re-porting",
     })
 }
 
@@ -778,6 +803,7 @@ mod tests {
             locale: "en-US".into(),
             tx: None,
             tx_cache_path: Some(tmp.cache_path()),
+            tx_from_cache: false,
             tx_attempted: false,
             tx_failure: None,
             verbose: false,
@@ -935,18 +961,25 @@ mod tests {
         assert!(lines[0].starts_with("twr: could not cache the transaction ingredients at "));
     }
 
-    #[tokio::test]
-    async fn refresh_tx_discards_the_cached_ingredients_and_derives_again() {
-        let x = FakeX::new(200);
-        let tmp = TmpDir::new("refresh");
-        let mut ctx = test_ctx(&x, &tmp);
+    /// As `build_ctx` leaves things after loading a fresh but wrong entry.
+    fn load_stale_cache(ctx: &mut ExecCtx<'_>, tmp: &TmpDir) {
         let stale = twr_tx::cache::CachedIngredients::new(&[9u8; 48], "stale", ctx.now_secs);
         twr_tx::cache::store(&tmp.cache_path(), &stale).unwrap();
         ctx.tx = Some(TxState {
             inner: twr_tx::ClientTransactionV1::new(vec![9u8; 48], "stale".into()),
         });
+        ctx.tx_from_cache = true;
+    }
+
+    #[tokio::test]
+    async fn refresh_tx_discards_the_cached_ingredients_and_derives_again() {
+        let x = FakeX::new(200);
+        let tmp = TmpDir::new("refresh");
+        let mut ctx = test_ctx(&x, &tmp);
+        load_stale_cache(&mut ctx, &tmp);
         ctx.refresh_tx("CreateBookmark").await;
 
+        assert!(!ctx.tx_from_cache, "now derived in this run");
         let cached = twr_tx::cache::load_fresh(&tmp.cache_path(), ctx.now_secs).unwrap();
         assert_eq!(cached.animation_key, PYTHON_ANIMATION_KEY);
         let tid = ctx.proof_for("CreateBookmark", "POST", "/p").unwrap();
@@ -958,11 +991,51 @@ mod tests {
         let x = FakeX::new(500);
         let tmp = TmpDir::new("refresh-fail");
         let mut ctx = test_ctx(&x, &tmp);
-        let stale = twr_tx::cache::CachedIngredients::new(&[9u8; 48], "stale", ctx.now_secs);
-        twr_tx::cache::store(&tmp.cache_path(), &stale).unwrap();
+        load_stale_cache(&mut ctx, &tmp);
+        ctx.refresh_tx("CreateBookmark").await;
+        // The failed round is not repeated for the same run.
         ctx.refresh_tx("CreateBookmark").await;
 
         assert!(ctx.tx.is_none());
+        assert!(!tmp.cache_path().exists());
+        assert_eq!(x.gets.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_tx_does_not_refetch_what_this_run_just_derived() {
+        let x = FakeX::new(200);
+        let tmp = TmpDir::new("refresh-fresh");
+        let mut ctx = test_ctx(&x, &tmp);
+        ctx.ensure_tx("CreateBookmark").await;
+        ctx.refresh_tx("CreateBookmark").await;
+
+        assert!(ctx.tx.is_some());
+        assert_eq!(
+            x.gets.lock().unwrap().len(),
+            2,
+            "no second home + chunk fetch"
+        );
+        assert!(tmp.cache_path().exists());
+    }
+
+    #[tokio::test]
+    async fn ingredients_with_an_unusable_key_are_reported_and_never_cached() {
+        let x = FakeX::new(200);
+        let tmp = TmpDir::new("bad-key");
+        let mut ctx = test_ctx(&x, &tmp);
+        let broken = twr_tx::cache::CachedIngredients {
+            key_b64: "***not base64***".into(),
+            animation_key: "k".into(),
+            derived_at_secs: ctx.now_secs,
+        };
+        ctx.install_ingredients("CreateBookmark", broken);
+
+        assert!(ctx.tx.is_none());
+        assert!(ctx
+            .tx_failure
+            .as_deref()
+            .unwrap()
+            .contains("not valid base64"));
         assert!(!tmp.cache_path().exists());
     }
 
@@ -972,7 +1045,7 @@ mod tests {
         let tmp = TmpDir::new("bookmark");
         let mut ctx = test_ctx(&x, &tmp);
         for op in ["CreateBookmark", "DeleteBookmark"] {
-            let post = post_engage_graphql(&mut ctx, op, "123").await.unwrap();
+            let post = post_engage_graphql(&mut ctx, op, "123", "k").await.unwrap();
             assert!(!post.resent);
         }
 
@@ -994,7 +1067,7 @@ mod tests {
         let x = FakeX::new(200);
         let tmp = TmpDir::new("like");
         let mut ctx = test_ctx(&x, &tmp);
-        post_engage_graphql(&mut ctx, "FavoriteTweet", "123")
+        post_engage_graphql(&mut ctx, "FavoriteTweet", "123", "k")
             .await
             .unwrap();
 
@@ -1009,7 +1082,7 @@ mod tests {
         let x = FakeX::new(500);
         let tmp = TmpDir::new("bookmark-fail");
         let mut ctx = test_ctx(&x, &tmp);
-        let post = post_engage_graphql(&mut ctx, "CreateBookmark", "123")
+        let post = post_engage_graphql(&mut ctx, "CreateBookmark", "123", "k")
             .await
             .unwrap();
 
@@ -1020,17 +1093,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_gated_404_is_resent_once_with_re_derived_ingredients() {
+    async fn a_gated_404_on_cached_ingredients_is_resent_once_with_re_derived_ones() {
         let x = FakeX::with_graphql(&[404, 200]);
         let tmp = TmpDir::new("resend");
         let mut ctx = test_ctx(&x, &tmp);
-        // As build_ctx would after loading a fresh but wrong cache entry.
-        let stale = twr_tx::cache::CachedIngredients::new(&[9u8; 48], "stale", ctx.now_secs);
-        twr_tx::cache::store(&tmp.cache_path(), &stale).unwrap();
-        ctx.tx = Some(TxState {
-            inner: twr_tx::ClientTransactionV1::new(vec![9u8; 48], "stale".into()),
-        });
-        let post = post_engage_graphql(&mut ctx, "CreateBookmark", "123")
+        load_stale_cache(&mut ctx, &tmp);
+        let post = post_engage_graphql(&mut ctx, "CreateBookmark", "123", "k")
             .await
             .unwrap();
 
@@ -1050,20 +1118,86 @@ mod tests {
         let x = FakeX::with_graphql(&[404, 404, 404]);
         let tmp = TmpDir::new("resend-once");
         let mut ctx = test_ctx(&x, &tmp);
-        let post = post_engage_graphql(&mut ctx, "CreateBookmark", "123")
+        let post = post_engage_graphql(&mut ctx, "CreateBookmark", "123", "k")
             .await
             .unwrap();
 
         assert_eq!(post.response.status, 404);
         assert!(post.resent);
-        assert_eq!(x.posts.lock().unwrap().len(), 2);
+        let posts = x.posts.lock().unwrap();
+        assert_eq!(posts.len(), 2);
+        // Derived in this run: the resend only needs a new id, not new pages.
+        assert_eq!(x.gets.lock().unwrap().len(), 2);
+        for p in posts.iter() {
+            let tid = header(p, "X-Client-Transaction-Id").unwrap();
+            assert!(tid_signs(tid, "POST", path_of(&p.0)));
+        }
 
         let data = engage_failure_data(&ctx, "bookmark", "CreateBookmark", &post);
-        let text = data.to_string();
-        assert!(text.contains("HTTP 404 even with an x-client-transaction-id"));
-        assert!(text.contains("resent once"));
-        assert!(!text.contains("doctor"), "{text}");
-        assert!(!text.contains("query id"), "{text}");
+        assert_eq!(
+            data["error"],
+            "bookmark failed: HTTP 404 even with an x-client-transaction-id (resent once with a new id)"
+        );
+        let suggestion = data["suggestion"].as_str().unwrap();
+        assert!(suggestion.contains("query id is stale"), "{suggestion}");
+        assert!(suggestion.contains("doctor --refresh"), "{suggestion}");
+        assert!(
+            suggestion.contains("derivation has drifted"),
+            "{suggestion}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_after_a_signed_404_does_not_claim_nothing_was_sent() {
+        let x = FakeX {
+            home_status: 500,
+            ..FakeX::with_graphql(&[404, 404])
+        };
+        let tmp = TmpDir::new("signed-then-refresh-fails");
+        let mut ctx = test_ctx(&x, &tmp);
+        load_stale_cache(&mut ctx, &tmp);
+        let post = post_engage_graphql(&mut ctx, "CreateBookmark", "123", "k")
+            .await
+            .unwrap();
+
+        assert!(post.first_had_tx);
+        assert!(!post.resent);
+        assert_eq!(x.posts.lock().unwrap().len(), 1);
+        assert!(has_header(
+            &x.posts.lock().unwrap()[0],
+            "X-Client-Transaction-Id"
+        ));
+        let data = engage_failure_data(&ctx, "bookmark", "CreateBookmark", &post);
+        let error = data["error"].as_str().unwrap();
+        assert!(
+            error.contains("404 with an x-client-transaction-id"),
+            "{error}"
+        );
+        assert!(error.contains("home page: HTTP 500"), "{error}");
+        assert!(
+            !error.contains("no x-client-transaction-id was sent"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_resend_goes_through_the_throttle() {
+        let x = FakeX::with_graphql(&[404, 200]);
+        let tmp = TmpDir::new("resend-throttle");
+        let mut ctx = test_ctx(&x, &tmp);
+        ctx.throttle.set_endpoint(
+            "k",
+            twr_client::BucketConfig {
+                rps: 0.001,
+                burst: 1.0,
+            },
+        );
+        post_engage_graphql(&mut ctx, "CreateBookmark", "123", "k")
+            .await
+            .unwrap();
+
+        // The one token of the bucket went to the resend.
+        assert!(ctx.throttle.wait_secs("k", now_f64()) > 0.0);
     }
 
     #[tokio::test]
@@ -1075,7 +1209,7 @@ mod tests {
         };
         let tmp = TmpDir::new("no-ingredients");
         let mut ctx = test_ctx(&x, &tmp);
-        let post = post_engage_graphql(&mut ctx, "CreateBookmark", "123")
+        let post = post_engage_graphql(&mut ctx, "CreateBookmark", "123", "k")
             .await
             .unwrap();
 
@@ -1087,7 +1221,7 @@ mod tests {
             data["error"],
             "bookmark failed: HTTP 404, no x-client-transaction-id was sent (home page: HTTP 500)"
         );
-        assert!(!data.to_string().contains("doctor"));
+        assert!(!data["error"].as_str().unwrap().contains("doctor"));
     }
 
     #[tokio::test]
@@ -1099,7 +1233,7 @@ mod tests {
         ctx.tx = Some(TxState {
             inner: twr_tx::ClientTransactionV1::new(vec![9u8; 48], "k".into()),
         });
-        let post = post_engage_graphql(&mut ctx, "FavoriteTweet", "123")
+        let post = post_engage_graphql(&mut ctx, "FavoriteTweet", "123", "k")
             .await
             .unwrap();
 
