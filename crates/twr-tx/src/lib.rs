@@ -32,8 +32,10 @@ use thiserror::Error;
 pub use frames::extract_frame_paths;
 
 /// The only ops that need the header, live-probed 2026-07-20 per the
-/// agentic-x reference; the bookmark pair answered 404 without it from
-/// 2026-10-20 (issue #3). Everything else answers 200 without it and must not
+/// agentic-x reference; CreateBookmark answered 404 without it and 200 with
+/// it on 2026-10-20 (issue #3), and DeleteBookmark is gated on the
+/// assumption that the pair shares the wall (not probed on its own).
+/// Everything else answers 200 without it and must not
 /// be sent one — attaching it to an ungated op is one more thing that can
 /// break for no benefit.
 pub const GATED_OPS: [&str; 5] = [

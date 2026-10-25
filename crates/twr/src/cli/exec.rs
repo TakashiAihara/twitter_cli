@@ -70,9 +70,9 @@ impl<'a> ExecCtx<'a> {
         }
     }
 
-    /// Use freshly derived ingredients and cache them. Unusable ones are
-    /// rejected before they reach the cache, where they would be served for
-    /// the next hour.
+    /// Use freshly derived ingredients and cache them. The key check only
+    /// catches a key that does not decode; a decodable but wrong key is
+    /// cached anyway, and `refresh_tx` evicts it on the first gated 404.
     fn install_ingredients(
         &mut self,
         operation: &str,
@@ -90,7 +90,6 @@ impl<'a> ExecCtx<'a> {
                 ));
             }
         }
-        self.tx_failure = None;
         self.tx_from_cache = false;
         self.tx = Some(TxState {
             inner: twr_tx::ClientTransactionV1::new(key_bytes, ingredients.animation_key),
@@ -116,6 +115,7 @@ impl<'a> ExecCtx<'a> {
             let _ = std::fs::remove_file(path);
         }
         self.tx = None;
+        self.tx_from_cache = false;
         self.ensure_tx(operation).await;
     }
 
@@ -145,7 +145,8 @@ impl<'a> ExecCtx<'a> {
         }
         let home_html = String::from_utf8_lossy(&home.body);
         let chunk_url = twr_tx::find_ondemand_url(&home_html).map_err(|e| e.to_string())?;
-        // The chunk is static CDN content: no cookie goes to a third-party host.
+        // The chunk is public static content on X's CDN: it needs no cookie,
+        // so none is sent off x.com.
         let chunk = self
             .transport
             .get(&chunk_url, &[])
@@ -450,9 +451,9 @@ pub struct EngagePost {
 
 /// POST one GraphQL engagement mutation (like / bookmark / retweet / pin …).
 /// Gated ops (`CreateBookmark`, `DeleteBookmark`) carry a freshly minted
-/// `x-client-transaction-id`; X answers them 404 without it. X also 404s a
-/// small share of requests that do carry one, and a cached key that went
-/// stale does the same, so a gated 404 is resent once with a new id (and
+/// `x-client-transaction-id`; X answers them 404 without it. X also 404'd
+/// 1 of 4 live requests that did carry one (2026-10-20), and a cached key
+/// that went stale does the same, so a gated 404 is resent once with a new id (and
 /// re-derived ingredients when the old ones came from the disk cache).
 ///
 /// The resend is a second write attempt that the caller's budget count does
@@ -1285,7 +1286,14 @@ mod tests {
             .collect();
         assert_eq!(reads.len(), 2);
         for read in reads {
-            assert!(has_header(read, "X-Client-Transaction-Id"), "{}", read.0);
+            let tid = header(read, "X-Client-Transaction-Id").expect(&read.0);
+            let path = path_of(&read.0).split('?').next().unwrap();
+            let method = if read.0.contains("SearchTimeline") {
+                "POST"
+            } else {
+                "GET"
+            };
+            assert!(tid_signs(tid, method, path), "{method} {path}");
         }
     }
 

@@ -1491,15 +1491,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // (via `ErrorKind::from_exit_code`) and whatever message the handler put
     // in `data.error` (or `data.saved`/`data.logged_out` failure shapes).
     if exit_code != 0 {
-        let message = data
-            .get("error")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("command failed (exit {exit_code})"));
-        let kind_enum = twr_core::ErrorKind::from_exit_code(exit_code)
-            .unwrap_or(twr_core::ErrorKind::GeneralAuth);
-        let err = error_with_data_suggestion(twr_core::TwrError::new(kind_enum, message), &data);
-        let envelope: Envelope<serde_json::Value> = Envelope::err(err).with_meta(meta);
+        let envelope: Envelope<serde_json::Value> =
+            Envelope::err(handler_error(exit_code, &data)).with_meta(meta);
         match opts.format {
             OutputFormat::Json => emit(&envelope),
             OutputFormat::Yaml => emit_yaml(&envelope)?,
@@ -1518,13 +1511,19 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A handler that explains its own failure (`error` + `suggestion` in its
-/// data) overrides the exit code's generic recovery hint, which can point the
-/// wrong way (exit 6 always says to refresh query ids).
-fn error_with_data_suggestion(
-    err: twr_core::TwrError,
-    data: &serde_json::Value,
-) -> twr_core::TwrError {
+/// The error envelope for a handler's non-zero exit. A handler that explains
+/// its own failure (`error` + `suggestion` in its data) overrides the exit
+/// code's generic recovery hint, which can point the wrong way (exit 6 always
+/// says to refresh query ids).
+fn handler_error(exit_code: i32, data: &serde_json::Value) -> twr_core::TwrError {
+    let message = data
+        .get("error")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("command failed (exit {exit_code})"));
+    let kind =
+        twr_core::ErrorKind::from_exit_code(exit_code).unwrap_or(twr_core::ErrorKind::GeneralAuth);
+    let err = twr_core::TwrError::new(kind, message);
     match (
         data.get("error"),
         data.get("suggestion").and_then(|s| s.as_str()),
@@ -6488,10 +6487,14 @@ mod error_suggestion_tests {
     use super::*;
 
     fn exit6(data: serde_json::Value) -> twr_core::TwrError {
-        error_with_data_suggestion(
-            twr_core::TwrError::new(twr_core::ErrorKind::ContractDrift, "boom"),
-            &data,
-        )
+        handler_error(6, &data)
+    }
+
+    #[test]
+    fn the_handler_message_becomes_the_error_message() {
+        let err = exit6(serde_json::json!({"error": "bookmark failed: HTTP 404"}));
+        assert_eq!(err.message, "bookmark failed: HTTP 404");
+        assert!(matches!(err.code, twr_core::ErrorKind::ContractDrift));
     }
 
     #[test]
