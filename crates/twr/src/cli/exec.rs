@@ -72,7 +72,8 @@ impl<'a> ExecCtx<'a> {
 
     /// Use freshly derived ingredients and cache them. The key check only
     /// catches a key that does not decode; a decodable but wrong key is
-    /// cached anyway, and `refresh_tx` evicts it on the first gated 404.
+    /// cached anyway and stays until a later run's engage POST gets a 404
+    /// with it and `refresh_tx` evicts it (gated reads never evict it).
     fn install_ingredients(
         &mut self,
         operation: &str,
@@ -453,8 +454,9 @@ pub struct EngagePost {
 /// Gated ops (`CreateBookmark`, `DeleteBookmark`) carry a freshly minted
 /// `x-client-transaction-id`; X answers them 404 without it. X also 404'd
 /// 1 of 4 live requests that did carry one (2026-10-20), and a cached key
-/// that went stale does the same, so a gated 404 is resent once with a new id (and
-/// re-derived ingredients when the old ones came from the disk cache).
+/// that went stale presumably does the same (not observed), so a gated 404
+/// is resent once with a new id (and re-derived ingredients when the old
+/// ones came from the disk cache).
 ///
 /// The resend is a second write attempt that the caller's budget count does
 /// not see; it goes through the throttle under `throttle_key` like the first.
@@ -465,7 +467,7 @@ pub async fn post_engage_graphql(
     throttle_key: &str,
 ) -> Result<EngagePost, twr_client::TransportError> {
     ctx.ensure_tx(op).await;
-    let first_had_tx = ctx.tx.is_some();
+    let first_had_tx = ctx.tx.is_some() && twr_tx::GATED_OPS.contains(&op);
     let mut response = send_engage(ctx, op, target_id).await?;
     let mut resent = false;
     if response.status == 404 && twr_tx::GATED_OPS.contains(&op) {
@@ -1288,11 +1290,7 @@ mod tests {
         for read in reads {
             let tid = header(read, "X-Client-Transaction-Id").expect(&read.0);
             let path = path_of(&read.0).split('?').next().unwrap();
-            let method = if read.0.contains("SearchTimeline") {
-                "POST"
-            } else {
-                "GET"
-            };
+            let method = if posts.contains(read) { "POST" } else { "GET" };
             assert!(tid_signs(tid, method, path), "{method} {path}");
         }
     }

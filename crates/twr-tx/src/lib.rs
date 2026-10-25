@@ -161,11 +161,13 @@ pub fn compute_animation_key(
             rows.len()
         )));
     };
-    let frame_time_product: i64 = byte_indices
+    // f64 like the reference's unbounded Python int: a chunk asking for many
+    // indices would overflow an i64 product.
+    let frame_time_product: f64 = byte_indices
         .iter()
-        .map(|&i| (key_bytes[i] as i64) % 16)
+        .map(|&i| f64::from(key_bytes[i] % 16))
         .product();
-    let frame_time = math::js_round(frame_time_product as f64 / 10.0) * 10.0;
+    let frame_time = math::js_round(frame_time_product / 10.0) * 10.0;
 
     Ok(math::animate(row, frame_time / TOTAL_TIME))
 }
@@ -362,6 +364,13 @@ mod tests {
         assert_eq!(first, second);
         assert!(!first.is_empty());
         assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn compute_animation_key_survives_a_product_past_i64() {
+        // Byte 15 has nibble 15, and 15^17 exceeds i64::MAX.
+        let frames = extract_frame_paths(&page());
+        compute_animation_key(&key_bytes(), &frames, ROW_INDEX_KEY, &[15; 17]).unwrap();
     }
 
     #[test]

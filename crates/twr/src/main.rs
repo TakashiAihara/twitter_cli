@@ -1511,10 +1511,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The error envelope for a handler's non-zero exit. A handler that explains
-/// its own failure (`error` + `suggestion` in its data) overrides the exit
-/// code's generic recovery hint, which can point the wrong way (exit 6 always
-/// says to refresh query ids).
+/// The error for a handler's non-zero exit. A handler that explains its own
+/// failure (an `error` key, of any value, plus a string `suggestion`)
+/// overrides the exit code's generic recovery hint, which can point the wrong
+/// way (exit 6 always says to refresh query ids).
 fn handler_error(exit_code: i32, data: &serde_json::Value) -> twr_core::TwrError {
     let message = data
         .get("error")
